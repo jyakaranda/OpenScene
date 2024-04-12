@@ -37,6 +37,7 @@ from navsim.planning.simulation.planner.pdm_planner.utils.graph_search.bfs_roadb
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 
+# 看预瞄点20m的位置lateral offset绝对值是否大于2，如果小于2则返回直行command，大于2则向左command，小于-2则向右command，没有route信息则返回unknown
 def get_driving_command(
     ego_pose: StateSE2,
     map_api: AbstractMap,

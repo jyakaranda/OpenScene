@@ -23,6 +23,7 @@ from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanSce
 NUPLAN_DB_PATH = os.environ["NUPLAN_DB_PATH"]
 NUPLAN_SENSOR_PATH = os.environ["NUPLAN_SENSOR_PATH"]
 
+# 读取bag中用到的每个camera的内外参
 def get_log_cam_info(log):
     log_name = log.logfile
     log_file = os.path.join(NUPLAN_DB_PATH, log_name + '.db')

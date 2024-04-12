@@ -1,6 +1,7 @@
 import pickle
 import os
 
+# 这不就时把dataset分组成train, val么，而且还有load/dump，直接挪文件不就行了么
 if __name__ == '__main__':
     mini_infos = os.listdir('dataset/openscene-v1.1/meta_datas/mini')
     mini_infos = [os.path.join('dataset/openscene-v1.1/meta_datas/mini', each) for each in mini_infos if each.endswith('.pkl')]

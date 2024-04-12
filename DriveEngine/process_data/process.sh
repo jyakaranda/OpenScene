@@ -2,18 +2,18 @@
 
 # Please install https://github.com/autonomousvision/navsim.
 # This is used for generating High-Level Driving Commands, used in E2E AD.
-export NAVSIM_DEVKIT_ROOT=/path/to/navsim
-export PYTHONPATH=${NAVSIM_DEVKIT_ROOT}:${PYTHONPATH}
+# export NAVSIM_DEVKIT_ROOT=/home/henry.zhang/navsim
+# export PYTHONPATH=${NAVSIM_DEVKIT_ROOT}:${PYTHONPATH}
 
-split=trainval
+split=mini
 # Please download all the nuplan data from https://www.nuscenes.org/nuplan.
-export NUPLAN_PATH=/path/to/nuplan/dataset/nuplan-v1.1
+export NUPLAN_PATH=/mnt/bigfile_2/henry/datasets/nuplan/dataset/nuplan-v1.1
 export NUPLAN_DB_PATH=${NUPLAN_PATH}/splits/${split}
 export NUPLAN_SENSOR_PATH=${NUPLAN_PATH}/sensor_blobs
 export NUPLAN_MAP_VERSION=nuplan-maps-v1.0
-export NUPLAN_MAPS_ROOT=/path/to/nuplan/dataset/maps
+export NUPLAN_MAPS_ROOT=/mnt/bigfile_2/kun/nuplan/dataset/nuplan-maps-v1.0
 
-OUT_DIR=./openscene-v1.1/meta_datas/${split}
+OUT_DIR=/mnt/bigfile_2/henry/datasets/navsim/test_process/${split}
 
 python create_openscene_metadata.py \
   --nuplan-root-path ${NUPLAN_PATH} \

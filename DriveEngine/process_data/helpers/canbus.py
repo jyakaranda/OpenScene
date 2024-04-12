@@ -1,6 +1,7 @@
 import numpy as np
 
 
+# 为啥管这个叫CanBus，不就是位姿信息么。。
 class CanBus:
     """Wrapper class to convert lidar_can_bus to numpy array"""
 

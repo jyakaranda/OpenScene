@@ -8,6 +8,7 @@ def get_scenes_per_thread(scenes, thread_num):
     cur_id = int(multiprocessing.current_process().name)
 
     num_scene = len(scenes)
+    # 直接用np.split分组就好
     a = num_scene//num_tasks
     b = num_scene % num_tasks
 

@@ -65,6 +65,8 @@ def create_nuplan_info(args):
 
         log_file = os.path.join(nuplan_db_path, log_db_name + ".db")
         if log_db_name not in log_sensors:
+            # 需要sensor blobs
+            tqdm.write(f"missing sensor files: {log_db_name} at {nuplan_sensor_root}")
             continue
 
         frame_idx = 0
@@ -74,7 +76,9 @@ def create_nuplan_info(args):
         lidar_pc_list = log_db.lidar_pc
         lidar_pcs = lidar_pc_list
 
+        # 读取bag中用到的每个camera的内外参
         log_cam_infos = get_log_cam_info(log_db.log)
+        # 从lidar_pcs中找第一个有八个camera数据的点云时间戳（并且时间戳与F0的diff最小（只检查满足前面条件的第一帧点云和第二帧点云））
         start_idx = get_closest_start_idx(log_db.log, lidar_pcs)
 
         # Find key_frames (controled by args.sample_interval)
@@ -102,7 +106,9 @@ def create_nuplan_info(args):
                 scene_list.append(scene_token)
                 frame_idx = 0
 
+            # 位姿信息
             can_bus = CanBus(lidar_pc).tensor
+            # 需要原始点云
             lidar = log_db.session.query(Lidar).filter(Lidar.token == lidar_token).all()
             pc_file_path = os.path.join(args.nuplan_sensor_path, pc_file_name)
             if not os.path.exists(pc_file_path):  # some lidar files are missing.
@@ -111,6 +117,7 @@ def create_nuplan_info(args):
                 tqdm.write(f"missing lidar files: {frame_str}")
                 continue
 
+            # 需要 traffic lights
             traffic_lights = []
             for traffic_light_status in get_traffic_light_status_for_lidarpc_token_from_db(
                 log_file, lidar_pc_token
@@ -139,6 +146,7 @@ def create_nuplan_info(args):
                 "vehicle_name": vehicle_name,
                 "can_bus": can_bus,
                 "lidar_path": pc_file_name,  # use the relative path.
+                # lidar外参
                 "lidar2ego_translation": lidar[0].translation_np,
                 "lidar2ego_rotation": [
                     lidar[0].rotation.w,
@@ -173,6 +181,7 @@ def create_nuplan_info(args):
             if next_key_token == None or next_key_token == "":
                 frame_idx = 0
             else:
+                # cur!=next，归0让next frame从0开始（注意这个frame id上面已经用过了，这里更新的是给next frame用的）
                 if next_key_scene != scene_token:
                     frame_idx = 0
                 else:
@@ -198,7 +207,7 @@ def create_nuplan_info(args):
             info["lidar2ego"] = l2e
             info["lidar2global"] = lidar2global
 
-            # obtain 8 image's information per frame
+            # obtain 8 image's information per frame 包含图像位置和内外参信息
             cams = get_cam_info_from_lidar_pc(log_db.log, lidar_pc, log_cam_infos)
             if cams == None:
                 broken_frame_tokens.append(lidar_pc_token)
@@ -208,8 +217,10 @@ def create_nuplan_info(args):
             info["cams"] = cams
 
             # Parse 3D object labels.
+            # 测试集还不太一样
             if not args.is_test:
                 if args.filter_instance:
+                    # 忽略某些lidar detection
                     fg_lidar_boxes = [
                         box for box in lidar_boxes if box.category.name not in filtered_classes
                     ]
@@ -222,6 +233,8 @@ def create_nuplan_info(args):
                 inv_ego_r = lidar_pc.ego_pose.trans_matrix_inv
                 ego_yaw = lidar_pc.ego_pose.quaternion.yaw_pitch_roll[0]
 
+                # 转到local坐标系
+                # 位姿
                 locs = np.array(
                     [
                         np.dot(
@@ -231,6 +244,7 @@ def create_nuplan_info(args):
                         for b in fg_lidar_boxes
                     ]
                 ).reshape(-1, 3)
+                # box
                 dims = np.array([[b.length, b.width, b.height] for b in fg_lidar_boxes]).reshape(
                     -1, 3
                 )
@@ -246,6 +260,7 @@ def create_nuplan_info(args):
                 names = [box.category.name for box in fg_lidar_boxes]
                 names = np.array(names)
                 gt_boxes_nuplan = np.concatenate([locs, dims, rots], axis=1)
+                # lidar detection信息
                 info["anns"] = dict(
                     gt_boxes=gt_boxes_nuplan,
                     gt_names=names,
@@ -285,6 +300,7 @@ def parse_args():
     parser.add_argument("--nuplan-map-root", help="path to nuplan map data.")
     parser.add_argument("--out-dir", help="output path.")
 
+    # nuplan数据是20hz，这里10 interval就是down sample成2hz
     parser.add_argument(
         "--sample-interval", type=int, default=10, help="interval of key frame samples."
     )

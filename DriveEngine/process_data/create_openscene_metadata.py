@@ -1,15 +1,10 @@
 import argparse
-import shutil
-from typing import Dict, List
 
-# import mmcv
 import numpy as np
 from os import listdir
 from os.path import isfile, join
 
 from pyquaternion import Quaternion
-import time
-import cv2
 
 from tqdm import tqdm
 

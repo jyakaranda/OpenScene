@@ -1,24 +1,13 @@
 import os
-import copy
-import shapely
-from shapely import affinity, ops
-from shapely.geometry import LineString, box, MultiPolygon, MultiLineString
 import numpy as np
-import mmcv
 from pyquaternion import Quaternion
 import pickle
-import cv2
-import matplotlib.pyplot as plt
-import torch
 
 from nuplan.database.nuplan_db.nuplan_scenario_queries import (
     get_images_from_lidar_tokens,
-    get_sensor_data_from_sensor_data_tokens_from_db,
-    get_cameras,
-    get_scenarios_from_db,
-    get_lidarpc_tokens_with_scenario_tag_from_db
+    get_cameras
 )
-from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanScenario, CameraChannel, LidarChannel
+from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import CameraChannel
 
 NUPLAN_DB_PATH = os.environ["NUPLAN_DB_PATH"]
 NUPLAN_SENSOR_PATH = os.environ["NUPLAN_SENSOR_PATH"]

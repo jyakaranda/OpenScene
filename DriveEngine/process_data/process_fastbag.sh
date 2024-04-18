@@ -20,4 +20,5 @@ python create_openscene_metadata_from_bag.py \
   --dataset-map-version ${DATASET_MAP_VERSION} \
   --dataset-map-root ${DATASET_MAPS_ROOT} \
   --out-dir ${OUT_DIR} \
+  --ignore-existed \
   --thread-num 32

@@ -2,282 +2,210 @@ import argparse
 import os
 from os import listdir
 from os.path import isfile, join
-from typing import Any, List, Dict
+from typing import Any, List, Dict, Optional, Union
 
 import multiprocessing
+import munch
 import numpy as np
 import pickle
 from pyquaternion import Quaternion
 from tqdm import tqdm
 
-from nuplan.common.actor_state.state_representation import StateSE2
-from nuplan.common.maps.nuplan_map.map_factory import get_maps_api
-
-from nuplan.database.nuplan_db_orm.nuplandb import NuPlanDB
-from nuplan.database.nuplan_db_orm.lidar import Lidar
-from nuplan.database.nuplan_db.nuplan_scenario_queries import (
-    get_traffic_light_status_for_lidarpc_token_from_db
-)
-
-from helpers.canbus import CanBus
-from helpers.driving_command import get_driving_command
 from helpers.multiprocess_helper import get_scenes_per_thread
-from helpers.nuplan_cameras_utils import (
-    get_log_cam_info, get_closest_start_idx, get_cam_info_from_lidar_pc
-)
 
-NUPLAN_MAPS_ROOT = os.environ["NUPLAN_MAPS_ROOT"]
+import fastbag
+from pluspy import topic_utils
+
+from localization_pb2 import LocalizationEstimation
+from obstacle_detection_pb2 import ObstacleDetection, PerceptionObstacle
+
 filtered_classes = ["traffic_cone", "barrier", "czone_sign", "generic_object"]
 
+
+def get_hash_value(data: Union[int, float, str, List, Dict]) -> str:
+    import hashlib
+    # Convert non-hashable types (like dict) to hashable types
+    if isinstance(data, dict):
+        import json
+        data = json.dumps(data, sort_keys=True)
+
+    # Convert all data to bytes and hash it
+    data_bytes = str(data).encode('utf-8')
+    hash_value = hashlib.sha256(data_bytes).hexdigest()
+
+    return hash_value[:16]
+
+
+def open_bag(bag_file: str) -> Optional[fastbag.Reader]:
+    if not os.path.exists(bag_file):
+        raise Exception(f"The input bag file {bag_file} doesn't  exist")
+
+    if bag_file.endswith('.db'):
+        bag = fastbag.Reader(bag_file)
+        bag.open()
+    else:
+        raise Exception('Input bag file not in supported format, only support fastbag(.db)')
+
+    return bag
+
+
+def convert_object_type(obs_type: PerceptionObstacle.Type) -> Optional[str]:
+    plus_type_to_nuplan_dict: Dict[PerceptionObstacle.Type, str] = {
+        PerceptionObstacle.CAR: "vehicle",
+        PerceptionObstacle.TRUCK: "vehicle",
+        PerceptionObstacle.BUS: "vehicle",
+        PerceptionObstacle.SUV: "vehicle",
+        PerceptionObstacle.LIGHTTRUCK: "vehicle",
+        PerceptionObstacle.VIRTUAL_CAR: "vehicle",
+        PerceptionObstacle.PEDESTRIAN: "pedestrian",
+        PerceptionObstacle.BICYCLE: "bicycle",
+        PerceptionObstacle.MOTO: "bicycle",
+        PerceptionObstacle.CONE: "traffic_cone",
+        PerceptionObstacle.BARRIER: "barrier",
+        PerceptionObstacle.CONSTRUCTION_AHEAD: "czone_sign",
+        PerceptionObstacle.ROAD_WORK_AHEAD: "czone_sign",
+        PerceptionObstacle.UNKNOWN: "generic_object",
+        # "ego" type is not incluced in plus yet
+    }
+    if obs_type not in plus_type_to_nuplan_dict.keys():
+        print(f"not processed obs_type: {PerceptionObstacle.Type.Name(obs_type)}, ignore it")
+        return None
+    return plus_type_to_nuplan_dict[obs_type]
+
+
+def populate_single_frame(frame: munch.Munch, frame_idx: int, localization_state: LocalizationEstimation, obstacle_detection: ObstacleDetection):
+    # basic info
+    frame.token = get_hash_value([frame.log_name, frame_idx])
+    frame.frame_idx = frame_idx
+    frame.timestamp = obstacle_detection.header.timestamp_msec * 1e-3
+    # temporarily using log_name as scene_name
+    frame.scene_name = frame.log_name
+    frame.scene_token = frame.log_token
+
+    # localization info
+    frame.can_bus = [
+        localization_state.position.x,
+        localization_state.position.y,
+        localization_state.position.z,
+        localization_state.orientation.qx,
+        localization_state.orientation.qy,
+        localization_state.orientation.qz,
+        localization_state.orientation.qw,
+        localization_state.linear_acceleration.x,
+        localization_state.linear_acceleration.y,
+        localization_state.linear_acceleration.z,
+        localization_state.linear_velocity.x,
+        localization_state.linear_velocity.y,
+        localization_state.linear_velocity.z,
+        localization_state.angular_velocity.x,
+        localization_state.angular_velocity.y,
+        localization_state.angular_velocity.z,
+        # yaw in radians
+        0.0,
+        # yaw in degrees
+        0.0,
+    ]
+    frame.ego2global_translation = frame.can_bus[:3]
+    frame.ego2global_rotation = frame.can_bus[3:7]
+    frame.ego_dynamic_state = [
+        localization_state.linear_velocity.x,
+        localization_state.linear_velocity.y,
+        localization_state.linear_acceleration.x,
+        localization_state.linear_acceleration.y,
+    ]
+
+    e2g_r_mat = Quaternion(frame.ego2global_rotation)
+    e2g = np.eye(4)
+    e2g[:3, :3] = e2g_r_mat
+    e2g[:3, -1] = frame.ego2global_translation
+    frame.ego2global = e2g
+
+    # unknown driving command by default
+    frame.driving_command = [0, 0, 0, 1]
+
+    # perception info
+    anns = frame.anns
+    obstacles_with_type = list(map(lambda obs: (obs, convert_object_type(obs.type)), obstacle_detection.obstacle))
+    filtered_obstacles = list(filter(lambda obs_with_type: obs_with_type[1] is not None, obstacles_with_type))
+    print(f"original obstacles: {len(obstacles_with_type)}, filtered obstacles: {len(filtered_obstacles)}")
+    pass
+
+
+def create_nuplan_info_from_db(args, db_name: str, msg_decoder: topic_utils.MessageDecoder):
+    tqdm.write(f"{multiprocessing.current_process().name}: {db_name}")
+    db_path = os.path.join(args.dataset_db_path, db_name)
+    bag = open_bag(db_path)
+    topics = ['/localization/state', '/perception/obstacles', '/perception/calibrations']
+    tqdm.write(f"vehicle_name: {bag.get_vehicle()}, filename: {bag.metadata}")
+    frame_template = munch.Munch(
+        token=None,
+        frame_idx=None,
+        timestamp=None,
+        log_name=db_name,
+        log_token=get_hash_value(db_name),
+        scene_name=None,
+        scene_token=None,
+        vehicle_name=bag.get_vehicle(),
+        can_bus=[],
+        # duplicated with can_bus
+        ego2global=None,
+        ego2global_translation=[],
+        ego2global_rotation=[],
+        ego_dynamic_state=[],
+        driving_command=[],
+        anns=munch.Munch(
+            gt_boxes=[],
+            gt_names=[],
+            gt_velocity_3d=[],
+            instance_tokens=[],
+            track_tokens=[],
+        ),
+        # need map convertion
+        map_location=None,
+        roadblock_ids=[],
+        # don't have yet
+        traffic_lights=[],
+        # unused
+        cams=None,
+        lidar2ego=None,
+        lidar2global=None,
+        lidar_path=None,
+        lidar2ego_translation=[],
+        lidar2ego_rotation=[],
+        sample_prev=None,
+        sample_next=None,
+    )
+
+    frame_infos = []
+    latest_loc_state: LocalizationEstimation = None
+    for topic, raw_msg, t in bag.read_messages(topics=topics, ros_time=False, raw=True):
+        if topic == '/localization/state':
+            latest_loc_state = msg_decoder.decode(topic, raw_msg[1], raw=True)
+        elif topic == '/perception/obstacles':
+            latest_obs_detection: ObstacleDetection = msg_decoder.decode(topic, raw_msg[1], raw=True)
+            frame = frame_template.copy()
+            # 处理populate异常情况：1. empty loc state; 2. unsynced messages
+            populate_single_frame(frame, len(frame_infos), latest_loc_state, latest_obs_detection)
+            frame_infos.append(frame)
+            if len(frame_infos) > 5:
+                break
+        else:
+            continue
+    tqdm.write(f"{frame_infos[0]}")
+
+
 def create_nuplan_info(args):
-    nuplan_sensor_root = args.nuplan_sensor_path
     # get all db files & assign db files for current thread.
-    log_sensors = os.listdir(nuplan_sensor_root)
-    nuplan_db_path = args.nuplan_db_path
+    dataset_db_path = args.dataset_db_path
     db_names_with_extension = [
-        f for f in listdir(nuplan_db_path) if isfile(join(nuplan_db_path, f))]
-    db_names = [name[:-3] for name in db_names_with_extension]
-    db_names.sort()
-    db_names_splited, start = get_scenes_per_thread(db_names, args.thread_num)
-    log_idx = start
+        f for f in listdir(dataset_db_path) if isfile(join(dataset_db_path, f))]
+    db_names_with_extension.sort()
+    db_names_splited, start = get_scenes_per_thread(db_names_with_extension, args.thread_num)
 
     # For each sequence...
+    msg_decoder = topic_utils.MessageDecoder()
     for log_db_name in db_names_splited:
-
-        frame_infos = []
-        scene_list = []
-        broken_frame_tokens = []
-
-        log_db = NuPlanDB(args.nuplan_root_path, join(nuplan_db_path, log_db_name + ".db"), None)
-        log_name = log_db.log_name
-        log_token = log_db.log.token
-        map_location = log_db.log.map_version
-        vehicle_name = log_db.log.vehicle_name
-
-        map_api = get_maps_api(NUPLAN_MAPS_ROOT, "nuplan-maps-v1.0", map_location)  # NOTE: lru cached
-
-        log_file = os.path.join(nuplan_db_path, log_db_name + ".db")
-        if log_db_name not in log_sensors:
-            # 需要sensor blobs
-            tqdm.write(f"missing sensor files: {log_db_name} at {nuplan_sensor_root}")
-            continue
-
-        frame_idx = 0
-        log_idx += 1
-
-        # list (sequence) of point clouds (each frame).
-        lidar_pc_list = log_db.lidar_pc
-        lidar_pcs = lidar_pc_list
-
-        # 读取bag中用到的每个camera的内外参
-        log_cam_infos = get_log_cam_info(log_db.log)
-        # 从lidar_pcs中找第一个有八个camera数据的点云时间戳（并且时间戳与F0的diff最小（只检查满足前面条件的第一帧点云和第二帧点云））
-        start_idx = get_closest_start_idx(log_db.log, lidar_pcs)
-
-        # Find key_frames (controled by args.sample_interval)
-        lidar_pc_list = lidar_pc_list[start_idx :: args.sample_interval]
-        index = -1
-        for lidar_pc in tqdm(lidar_pc_list, dynamic_ncols=True):
-            index += 1
-            # LiDAR attributes.
-            lidar_pc_token = lidar_pc.token
-            scene_token = lidar_pc.scene_token
-            pc_file_name = lidar_pc.filename
-            next_token = lidar_pc.next_token
-            prev_token = lidar_pc.prev_token
-            lidar_token = lidar_pc.lidar_token
-            time_stamp = lidar_pc.timestamp
-            scene_name = f"log-{log_idx:04d}-{lidar_pc.scene.name}"
-            lidar_boxes = lidar_pc.lidar_boxes
-            roadblock_ids = [
-                str(roadblock_id)
-                for roadblock_id in str(lidar_pc.scene.roadblock_ids).split(" ")
-                if len(roadblock_id) > 0
-            ]
-
-            if scene_token not in scene_list:
-                scene_list.append(scene_token)
-                frame_idx = 0
-
-            # 位姿信息
-            can_bus = CanBus(lidar_pc).tensor
-            # 需要原始点云
-            lidar = log_db.session.query(Lidar).filter(Lidar.token == lidar_token).all()
-            pc_file_path = os.path.join(args.nuplan_sensor_path, pc_file_name)
-            if not os.path.exists(pc_file_path):  # some lidar files are missing.
-                broken_frame_tokens.append(lidar_pc_token)
-                frame_str = f"{log_db_name}, {lidar_pc_token}"
-                tqdm.write(f"missing lidar files: {frame_str}")
-                continue
-
-            # 需要 traffic lights
-            traffic_lights = []
-            for traffic_light_status in get_traffic_light_status_for_lidarpc_token_from_db(
-                log_file, lidar_pc_token
-            ):
-                lane_connector_id: int = traffic_light_status.lane_connector_id
-                is_red: bool = traffic_light_status.status.value == 2
-                traffic_lights.append((lane_connector_id, is_red))
-
-            ego_pose = StateSE2(
-                lidar_pc.ego_pose.x,
-                lidar_pc.ego_pose.y,
-                lidar_pc.ego_pose.quaternion.yaw_pitch_roll[0],
-            )
-            driving_command = get_driving_command(ego_pose, map_api, roadblock_ids)
-
-            info = {
-                "token": lidar_pc_token,
-                "frame_idx": frame_idx,
-                "timestamp": time_stamp,
-                "log_name": log_name,
-                "log_token": log_token,
-                "scene_name": scene_name,
-                "scene_token": scene_token,
-                "map_location": map_location,
-                "roadblock_ids": roadblock_ids,
-                "vehicle_name": vehicle_name,
-                "can_bus": can_bus,
-                "lidar_path": pc_file_name,  # use the relative path.
-                # lidar外参
-                "lidar2ego_translation": lidar[0].translation_np,
-                "lidar2ego_rotation": [
-                    lidar[0].rotation.w,
-                    lidar[0].rotation.x,
-                    lidar[0].rotation.y,
-                    lidar[0].rotation.z,
-                ],
-                "ego2global_translation": can_bus[:3],
-                "ego2global_rotation": can_bus[3:7],
-                "ego_dynamic_state": [
-                    lidar_pc.ego_pose.vx,
-                    lidar_pc.ego_pose.vy,
-                    lidar_pc.ego_pose.acceleration_x,
-                    lidar_pc.ego_pose.acceleration_y,
-                ],
-                "traffic_lights": traffic_lights,
-                "driving_command": driving_command, 
-                "cams": dict(),
-            }
-            info["sample_prev"] = None
-            info["sample_next"] = None
-
-            if index > 0:  # find prev.
-                info["sample_prev"] = lidar_pc_list[index - 1].token
-            if index < len(lidar_pc_list) - 1:  # find next.
-                next_key_token = lidar_pc_list[index + 1].token
-                next_key_scene = lidar_pc_list[index + 1].scene_token
-                info["sample_next"] = next_key_token
-            else:
-                next_key_token, next_key_scene = None, None
-
-            if next_key_token == None or next_key_token == "":
-                frame_idx = 0
-            else:
-                # cur!=next，归0让next frame从0开始（注意这个frame id上面已经用过了，这里更新的是给next frame用的）
-                if next_key_scene != scene_token:
-                    frame_idx = 0
-                else:
-                    frame_idx += 1
-
-            # Parse lidar2ego translation.
-            l2e_r = info["lidar2ego_rotation"]
-            l2e_t = info["lidar2ego_translation"]
-            e2g_r = info["ego2global_rotation"]
-            e2g_t = info["ego2global_translation"]
-            l2e_r_mat = Quaternion(l2e_r).rotation_matrix
-            e2g_r_mat = Quaternion(e2g_r).rotation_matrix
-
-            # add lidar2global: map point coord in lidar to point coord in the global
-            l2e = np.eye(4)
-            l2e[:3, :3] = l2e_r_mat
-            l2e[:3, -1] = l2e_t
-            e2g = np.eye(4)
-            e2g[:3, :3] = e2g_r_mat
-            e2g[:3, -1] = e2g_t
-            lidar2global = np.dot(e2g, l2e)
-            info["ego2global"] = e2g
-            info["lidar2ego"] = l2e
-            info["lidar2global"] = lidar2global
-
-            # obtain 8 image's information per frame 包含图像位置和内外参信息
-            cams = get_cam_info_from_lidar_pc(log_db.log, lidar_pc, log_cam_infos)
-            if cams == None:
-                broken_frame_tokens.append(lidar_pc_token)
-                frame_str = f"{log_db_name}, {lidar_pc_token}"
-                tqdm.write(f"not all cameras are available: {frame_str}")
-                continue
-            info["cams"] = cams
-
-            # Parse 3D object labels.
-            # 测试集还不太一样
-            if not args.is_test:
-                if args.filter_instance:
-                    # 忽略某些lidar detection
-                    fg_lidar_boxes = [
-                        box for box in lidar_boxes if box.category.name not in filtered_classes
-                    ]
-                else:
-                    fg_lidar_boxes = lidar_boxes
-
-                instance_tokens = [item.token for item in fg_lidar_boxes]
-                track_tokens = [item.track_token for item in fg_lidar_boxes]
-
-                inv_ego_r = lidar_pc.ego_pose.trans_matrix_inv
-                ego_yaw = lidar_pc.ego_pose.quaternion.yaw_pitch_roll[0]
-
-                # 转到local坐标系
-                # 位姿
-                locs = np.array(
-                    [
-                        np.dot(
-                            inv_ego_r[:3, :3],
-                            (b.translation_np - lidar_pc.ego_pose.translation_np).T,
-                        ).T
-                        for b in fg_lidar_boxes
-                    ]
-                ).reshape(-1, 3)
-                # box
-                dims = np.array([[b.length, b.width, b.height] for b in fg_lidar_boxes]).reshape(
-                    -1, 3
-                )
-                rots = np.array([b.yaw for b in fg_lidar_boxes]).reshape(-1, 1)
-                rots = rots - ego_yaw
-
-                velocity_3d = np.array([[b.vx, b.vy, b.vz] for b in fg_lidar_boxes]).reshape(-1, 3)
-                for i in range(len(fg_lidar_boxes)):
-                    velo = velocity_3d[i]
-                    velo = velo @ np.linalg.inv(e2g_r_mat).T @ np.linalg.inv(l2e_r_mat).T
-                    velocity_3d[i] = velo
-
-                names = [box.category.name for box in fg_lidar_boxes]
-                names = np.array(names)
-                gt_boxes_nuplan = np.concatenate([locs, dims, rots], axis=1)
-                # lidar detection信息
-                info["anns"] = dict(
-                    gt_boxes=gt_boxes_nuplan,
-                    gt_names=names,
-                    gt_velocity_3d=velocity_3d.reshape(-1, 3),
-                    instance_tokens=instance_tokens,
-                    track_tokens=track_tokens,
-                )
-            frame_infos.append(info)
-
-        del map_api
-
-        # after check.
-        for info in frame_infos:
-            if info["sample_prev"] in broken_frame_tokens:
-                info["sample_prev"] = None
-            if info["sample_next"] in broken_frame_tokens:
-                info["sample_next"] = None
-
-        pkl_file_path = f"{args.out_dir}/{log_name}.pkl"
-        os.makedirs(args.out_dir, exist_ok=True)
-
-        with open(pkl_file_path, "wb") as f:
-            pickle.dump(frame_infos, f, protocol=pickle.HIGHEST_PROTOCOL)
-
+        create_nuplan_info_from_db(args, log_db_name, msg_decoder)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train a detector")
@@ -286,12 +214,12 @@ def parse_args():
     )
 
     # directory configurations.
-    parser.add_argument("--nuplan-root-path", help="the path to nuplan root path.")
-    parser.add_argument("--nuplan-db-path", help="the dir saving nuplan db.")
-    parser.add_argument("--nuplan-sensor-path", help="the dir to nuplan sensor data.")
-    parser.add_argument("--nuplan-map-version", help="nuplan mapping dataset version.")
-    parser.add_argument("--nuplan-map-root", help="path to nuplan map data.")
-    parser.add_argument("--out-dir", help="output path.")
+    parser.add_argument("--dataset-root-path", type=str, default=None, help="the path to dataset root path.")
+    parser.add_argument("--dataset-db-path", type=str, default=None, help="the dir saving dataset db.")
+    parser.add_argument("--dataset-sensor-path", type=str, default=None, help="the dir to dataset sensor data.")
+    parser.add_argument("--dataset-map-version", type=str, default=None, help="dataset mapping dataset version.")
+    parser.add_argument("--dataset-map-root", type=str, default=None, help="path to dataset map data.")
+    parser.add_argument("--out-dir", type=str, default=None, help="output path.")
 
     # nuplan数据是20hz，这里10 interval就是down sample成2hz
     parser.add_argument(
@@ -299,11 +227,10 @@ def parse_args():
     )
 
     # split.
-    parser.add_argument("--is-test", action="store_true", help="Dealing with Test set data.")
+    parser.add_argument("--is-test", default=False, action="store_true", help="Dealing with Test set data.")
     parser.add_argument(
-        "--filter-instance", action="store_true", help="Ignore instances in filtered_classes."
+        "--filter-instance", default=False, action="store_true", help="Ignore instances in filtered_classes."
     )
-    parser.add_argument("--split", type=str, default="train", help="Train/Val/Test set.")
 
     args = parser.parse_args()
     return args
@@ -311,13 +238,6 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-
-    nuplan_root_path = args.nuplan_root_path
-    nuplan_db_path = args.nuplan_db_path
-    nuplan_sensor_path = args.nuplan_sensor_path
-    nuplan_map_version = args.nuplan_map_version
-    nuplan_map_root = args.nuplan_map_root
-    out_dir = args.out_dir
 
     manager = multiprocessing.Manager()
     # return_dict = manager.dict()

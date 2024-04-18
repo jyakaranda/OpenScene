@@ -45,7 +45,9 @@ class CanBus:
                 self.angular_rate_x,
                 self.angular_rate_y,
                 self.angular_rate_z,
+                # yaw in radians
                 0.0,
+                # yaw in degrees
                 0.0,
             ]
         )
